@@ -20,17 +20,19 @@ sys.path.insert(0, os.path.abspath(".."))
 autodoc_mock_imports = [
     "bs4",
     "editdistance",
+    "fonduer.learning.classifier",
     "lxml",
+    "matplotlib",
     "nltk",
-    "numba",
-    "numbskull",
     "numpy",
     "pandas",
-    "pdftotree",
-    "psycopyg2",
+    "psycopg2",
     "scipy",
+    "snorkel-metal",
     "spacy",
-    "tensorflow",
+    "torch",
+    "torchvision",
+    "tqdm",
     "treedlib",
     "wand",
     "yaml",
@@ -101,7 +103,7 @@ html_theme = "sphinx_rtd_theme"
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ["_static"]
+html_static_path = ["static"]
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.
