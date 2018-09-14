@@ -31,10 +31,11 @@ logger = logging.getLogger(__name__)
 class Parser(UDFRunner):
     def __init__(
         self,
+        session,
+        parallelism=1,
         structural=True,  # structural information
         blacklist=["style", "script"],  # ignore tag types, default: style, script
         flatten=["span", "br"],  # flatten tag types, default: span, br
-        flatten_delim="",
         language="en",
         lingual=True,  # lingual information
         strip=True,
@@ -43,26 +44,42 @@ class Parser(UDFRunner):
         visual=False,  # visual information
         pdf_path=None,
     ):
-        # Use spaCy as our lingual parser
-        self.lingual_parser = Spacy(language)
+        """Initialize the Parser.
 
+        :param session: The database session to use.
+        :param parallelism: The number of processes to use in parallel. Default 1.
+        :param structural: Whether to parse structural information from a DOM.
+        :param blacklist: A list of tag types to ignore. Default ["style", "script"].
+        :param flatten: A list of tag types to flatten. Default ["span", "br"]
+        :param language: Which spaCy NLP language package. Default "en".
+        :param lingual: Whether or not to include NLP information. Default True.
+        :param strip: Whether or not to strip whitespace during parsing. Default True.
+        :param replacements: A list of tuples where the regex string in the
+            first position is replaced by the character in the second position.
+            Default [(u"[\u2010\u2011\u2012\u2013\u2014\u2212\uf02d]", "-")].
+        :param tabular: Whether to include tabular information in the parse.
+        :param visual: Whether to include visual information in the parse.
+            Requires PDFs for each input document.
+        :param pdf_path: The path to the corresponding PDFs use for visual info.
+        """
         super(Parser, self).__init__(
+            session,
             ParserUDF,
+            parallelism=parallelism,
             structural=structural,
             blacklist=blacklist,
             flatten=flatten,
-            flatten_delim=flatten_delim,
             lingual=lingual,
             strip=strip,
             replacements=replacements,
             tabular=tabular,
             visual=visual,
             pdf_path=pdf_path,
-            lingual_parser=self.lingual_parser,
+            language=language,
         )
 
-    def clear(self, session, **kwargs):
-        session.query(Context).delete()
+    def clear(self, **kwargs):
+        self.session.query(Context).delete()
 
 
 class ParserUDF(UDF):
@@ -71,14 +88,13 @@ class ParserUDF(UDF):
         structural,
         blacklist,
         flatten,
-        flatten_delim,
         lingual,
         strip,
         replacements,
         tabular,
         visual,
         pdf_path,
-        lingual_parser,
+        language,
         **kwargs
     ):
         """
@@ -97,21 +113,34 @@ class ParserUDF(UDF):
         self.structural = structural
         self.blacklist = blacklist if isinstance(blacklist, list) else [blacklist]
         self.flatten = flatten if isinstance(flatten, list) else [flatten]
-        self.flatten_delim = flatten_delim
 
         # lingual setup
-        self.lingual = lingual
+        self.language = language
         self.strip = strip
         self.replacements = []
         for (pattern, replace) in replacements:
             self.replacements.append((re.compile(pattern, flags=re.UNICODE), replace))
-        if self.lingual:
-            self.lingual_parser = lingual_parser
-            self.lingual_parse = self.lingual_parser.split_sentences
-            self.lingual_nlp = self.lingual_parser.parse
 
+        self.lingual = lingual
+        self.lingual_parser = Spacy(self.language)
+        if self.lingual_parser.has_tokenizer_support():
+            self.tokenize_and_split_sentences = self.lingual_parser.split_sentences
+            self.lingual_parser.load_lang_model()
         else:
-            self.lingual_parse = SimpleTokenizer().parse
+            self.tokenize_and_split_sentences = SimpleTokenizer().parse
+
+        if self.lingual:
+            if self.lingual_parser.has_NLP_support():
+                self.enrich_tokenized_sentences_with_nlp = (
+                    self.lingual_parser.enrich_sentences_with_NLP
+                )
+            else:
+                logger.warning(
+                    "Lingual mode will be turned off, "
+                    "as spacy doesn't provide support for this "
+                    "language ({})".format(self.language)
+                )
+                self.lingual = False
 
         # tabular setup
         self.tabular = tabular
@@ -122,9 +151,9 @@ class ParserUDF(UDF):
             self.pdf_path = pdf_path
             self.vizlink = VisualLinker()
 
-    def apply(self, x, **kwargs):
-        # The document is the Document model. Text is string representation.
-        document, text = x
+    def apply(self, document, **kwargs):
+        # The document is the Document model
+        text = document.text
         if self.visual:
             if not self.pdf_path:
                 warnings.warn(
@@ -357,7 +386,7 @@ class ParserUDF(UDF):
         field = state["paragraph"]["field"]
         # Lingual Parse
         document = state["document"]
-        for parts in self.lingual_parse(document, text):
+        for parts in self.tokenize_and_split_sentences(document, text):
             parts["document"] = document
             # NOTE: Why do we overwrite this from the spacy parse?
             parts["position"] = state["sentence"]["idx"]
@@ -389,7 +418,10 @@ class ParserUDF(UDF):
                     if attr.find("style") >= 0:
                         cur_style_index = index
                         break
-                styles = state["root"].find("head").find("style")
+                head = state["root"].find("head")
+                styles = None
+                if head is not None:
+                    styles = head.find("style")
                 if styles is not None:
                     for x in list(context_node.attrib.items()):
                         if x[0] == "class":
@@ -636,7 +668,7 @@ class ParserUDF(UDF):
         state["parent"][root] = document
         state["context"][root] = document
 
-        all_sentences = []
+        tokenized_sentences = []
         while stack:
             node = stack.pop()
             if node not in state["visited"]:
@@ -644,7 +676,7 @@ class ParserUDF(UDF):
 
                 # Process
                 if self.lingual:
-                    all_sentences += [y for y in self._parse_node(node, state)]
+                    tokenized_sentences += [y for y in self._parse_node(node, state)]
                 else:
                     yield from self._parse_node(node, state)
 
@@ -670,4 +702,4 @@ class ParserUDF(UDF):
                     )
 
         if self.lingual:
-            yield from self.lingual_nlp(all_sentences)
+            yield from self.enrich_tokenized_sentences_with_nlp(tokenized_sentences)

@@ -15,7 +15,7 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath(".."))
+sys.path.insert(0, os.path.abspath("../src"))
 
 autodoc_mock_imports = [
     "bs4",
@@ -31,7 +31,6 @@ autodoc_mock_imports = [
     "snorkel-metal",
     "spacy",
     "torch",
-    "torchvision",
     "tqdm",
     "treedlib",
     "wand",

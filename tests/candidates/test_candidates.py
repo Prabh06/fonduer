@@ -5,7 +5,8 @@ import os
 import pytest
 
 from fonduer import Meta
-from fonduer.candidates import CandidateExtractor, MentionExtractor
+from fonduer.candidates import CandidateExtractor, MentionExtractor, MentionNgrams
+from fonduer.candidates.matchers import PersonMatcher
 from fonduer.candidates.mentions import Ngrams
 from fonduer.candidates.models import Candidate, candidate_subclass, mention_subclass
 from fonduer.parser import Parser
@@ -91,8 +92,9 @@ def test_span_char_start_and_char_end(caplog):
 def test_cand_gen(caplog):
     """Test extracting candidates from mentions from documents."""
     caplog.set_level(logging.INFO)
-    # SpaCy on mac has issue on parallel parseing
+    # SpaCy on mac has issue on parallel parsing
     if os.name == "posix":
+        logger.info("Using single core.")
         PARALLEL = 1
     else:
         PARALLEL = 2  # Travis only gives 2 cores
@@ -107,7 +109,7 @@ def test_cand_gen(caplog):
     logger.info("Parsing...")
     doc_preprocessor = HTMLDocPreprocessor(docs_path, max_docs=max_docs)
     corpus_parser = Parser(
-        structural=True, lingual=True, visual=True, pdf_path=pdf_path
+        session, structural=True, lingual=True, visual=True, pdf_path=pdf_path
     )
     corpus_parser.apply(doc_preprocessor, parallelism=PARALLEL)
     assert session.query(Document).count() == max_docs
@@ -125,18 +127,21 @@ def test_cand_gen(caplog):
 
     with pytest.raises(ValueError):
         mention_extractor = MentionExtractor(
+            session,
             [Part, Temp, Volt],
             [part_ngrams, volt_ngrams],  # Fail, mismatched arity
             [part_matcher, temp_matcher, volt_matcher],
         )
     with pytest.raises(ValueError):
         mention_extractor = MentionExtractor(
+            session,
             [Part, Temp, Volt],
             [part_ngrams, temp_matcher, volt_ngrams],
             [part_matcher, temp_matcher],  # Fail, mismatched arity
         )
 
     mention_extractor = MentionExtractor(
+        session,
         [Part, Temp, Volt],
         [part_ngrams, temp_ngrams, volt_ngrams],
         [part_matcher, temp_matcher, volt_matcher],
@@ -157,8 +162,52 @@ def test_cand_gen(caplog):
     PartTemp = candidate_subclass("PartTemp", [Part, Temp])
     PartVolt = candidate_subclass("PartVolt", [Part, Volt])
 
+    with pytest.raises(ValueError):
+        candidate_extractor = CandidateExtractor(
+            session,
+            [PartTemp, PartVolt],
+            throttlers=[
+                temp_throttler,
+                volt_throttler,
+                volt_throttler,
+            ],  # Fail, mismatched arity
+        )
+
+    with pytest.raises(ValueError):
+        candidate_extractor = CandidateExtractor(
+            session,
+            [PartTemp],  # Fail, mismatched arity
+            throttlers=[temp_throttler, volt_throttler],
+        )
+
+    # Test that no throttler in candidate extractor
     candidate_extractor = CandidateExtractor(
-        [PartTemp, PartVolt], throttlers=[temp_throttler, volt_throttler]
+        session, [PartTemp, PartVolt]
+    )  # Pass, no throttler
+
+    candidate_extractor.apply(docs, split=0, parallelism=PARALLEL)
+
+    assert session.query(PartTemp).count() == 3654
+    assert session.query(PartVolt).count() == 3657
+    assert session.query(Candidate).count() == 7311
+    candidate_extractor.clear_all(split=0)
+    assert session.query(Candidate).count() == 0
+
+    # Test that None in throttlers in candidate extractor
+    candidate_extractor = CandidateExtractor(
+        session, [PartTemp, PartVolt], throttlers=[temp_throttler, None]
+    )
+
+    candidate_extractor.apply(docs, split=0, parallelism=PARALLEL)
+
+    assert session.query(PartTemp).count() == 3530
+    assert session.query(PartVolt).count() == 3657
+    assert session.query(Candidate).count() == 7187
+    candidate_extractor.clear_all(split=0)
+    assert session.query(Candidate).count() == 0
+
+    candidate_extractor = CandidateExtractor(
+        session, [PartTemp, PartVolt], throttlers=[temp_throttler, volt_throttler]
     )
 
     candidate_extractor.apply(docs, split=0, parallelism=PARALLEL)
@@ -183,3 +232,48 @@ def test_cand_gen(caplog):
     session.query(Volt).delete()
     assert session.query(Volt).count() == 0
     assert session.query(PartVolt).count() == 0
+
+
+def test_ngrams(caplog):
+    """Test ngram limits in mention extraction"""
+    caplog.set_level(logging.INFO)
+    PARALLEL = 1
+
+    max_docs = 1
+    session = Meta.init("postgres://localhost:5432/" + DB).Session()
+
+    docs_path = "tests/data/pure_html/lincoln_short.html"
+
+    logger.info("Parsing...")
+    doc_preprocessor = HTMLDocPreprocessor(docs_path, max_docs=max_docs)
+    corpus_parser = Parser(session, structural=True, lingual=True)
+    corpus_parser.apply(doc_preprocessor, parallelism=PARALLEL)
+    assert session.query(Document).count() == max_docs
+    assert session.query(Sentence).count() == 503
+    docs = session.query(Document).order_by(Document.name).all()
+
+    # Mention Extraction
+    Person = mention_subclass("Person")
+    person_ngrams = MentionNgrams(n_max=3)
+    person_matcher = PersonMatcher()
+
+    mention_extractor = MentionExtractor(
+        session, [Person], [person_ngrams], [person_matcher]
+    )
+    mention_extractor.apply(docs, parallelism=PARALLEL)
+
+    assert session.query(Person).count() == 126
+    mentions = session.query(Person).all()
+    assert len([x for x in mentions if x.span.get_n() == 1]) == 50
+    assert len([x for x in mentions if x.span.get_n() > 3]) == 0
+
+    # Test for unigram exclusion
+    person_ngrams = MentionNgrams(n_min=2, n_max=3)
+    mention_extractor = MentionExtractor(
+        session, [Person], [person_ngrams], [person_matcher]
+    )
+    mention_extractor.apply(docs, parallelism=PARALLEL)
+    assert session.query(Person).count() == 76
+    mentions = session.query(Person).all()
+    assert len([x for x in mentions if x.span.get_n() == 1]) == 0
+    assert len([x for x in mentions if x.span.get_n() > 3]) == 0
